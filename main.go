@@ -11,11 +11,12 @@ import (
 	"github.com/pborman/uuid"
 	"strings"
 	"context"
-	"cloud.google.com/go/bigtable"
+	//"cloud.google.com/go/bigtable"
 	"github.com/auth0/go-jwt-middleware"
 	"github.com/dgrijalva/jwt-go"
 	"github.com/gorilla/mux"
-
+	"cloud.google.com/go/storage"
+	"io"
 )
 
 var mySigningKey = []byte("secret")
@@ -30,6 +31,7 @@ type Post struct {
 	User     string `json:"user"`
 	Message  string  `json:"message"`
 	Location Location `json:"location"`
+	Url    string `json:"url"`
 }
 
 const (
@@ -40,7 +42,10 @@ const (
 	PROJECT_ID = "essential-storm-194222"
 	BT_INSTANCE = "around-post"
 	// Needs to update this URL if you deploy it to cloud.
-	ES_URL = "http://35.196.222.226:9200/"
+	ES_URL = "http://35.196.60.23:9200/"
+	// Needs to update this bucket based on your gcs bucket name.
+	BUCKET_NAME = "post-images-chaoma"
+
 )
 
 
@@ -102,6 +107,10 @@ func main() {
 
 func handlerPost(w http.ResponseWriter, r *http.Request) {
 	// Parse from body of request to get a json object.
+	user := r.Context().Value("user")
+	claims := user.(*jwt.Token).Claims
+	username := claims.(jwt.MapClaims)["username"]
+
 	fmt.Println("Received one post request")
 	decoder := json.NewDecoder(r.Body)
 	var p Post
@@ -109,24 +118,42 @@ func handlerPost(w http.ResponseWriter, r *http.Request) {
 		panic(err)
 		return
 	}
-	id := uuid.New()
-	// Save to ES.
-	saveToES(&p, id)
-	fmt.Fprintf(w, "Post received: %s\n", p.Message)
+	p.User = username.(string)
 
-	ctx := context.Background()
-	// you must update project name here
-	bt_client, err := bigtable.NewClient(ctx, PROJECT_ID, BT_INSTANCE)
+	// Create a client
+	es_client, err := elastic.NewClient(elastic.SetURL(ES_URL), elastic.SetSniff(false))
 	if err != nil {
 		panic(err)
 		return
 	}
 
-	// Save to BT
+	id := uuid.New()
+
+	// Save it to index
+	_, err = es_client.Index().
+		Index(INDEX).
+		Type(TYPE).
+		Id(id).
+		BodyJson(p).
+		Refresh(true).
+		Do()
+	if err != nil {
+		panic(err)
+		return
+	}
+
+	fmt.Printf("Post is saved to Index: %s\n", p.Message)
+	/*
+	ctx := context.Background()
+	bt_client, err := bigtable.NewClient(ctx, PROJECT_ID, BT_INSTANCE)
+	if err != nil {
+	       panic(err)
+	       return
+	}
+
 	tbl := bt_client.Open("post")
 	mut := bigtable.NewMutation()
 	t := bigtable.Now()
-
 	mut.Set("post", "user", t, []byte(p.User))
 	mut.Set("post", "message", t, []byte(p.Message))
 	mut.Set("location", "lat", t, []byte(strconv.FormatFloat(p.Location.Lat, 'f', -1, 64)))
@@ -134,11 +161,47 @@ func handlerPost(w http.ResponseWriter, r *http.Request) {
 
 	err = tbl.Apply(ctx, id, mut)
 	if err != nil {
-		panic(err)
-		return
+	       panic(err)
+	       return
 	}
 	fmt.Printf("Post is saved to BigTable: %s\n", p.Message)
+	*/
 }
+
+
+func saveToGCS(ctx context.Context, r io.Reader, bucket, name string) (*storage.ObjectHandle, *storage.ObjectAttrs, error) {
+	client, err := storage.NewClient(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer client.Close()
+
+	bh := client.Bucket(bucket)
+	// Next check if the bucket exists
+	if _, err = bh.Attrs(ctx); err != nil {
+		return nil, nil, err
+	}
+
+	obj := bh.Object(name)
+	w := obj.NewWriter(ctx)
+	if _, err := io.Copy(w, r); err != nil {
+		return nil, nil, err
+	}
+	if err := w.Close(); err != nil {
+		return nil, nil, err
+	}
+
+
+	if err := obj.ACL().Set(ctx, storage.AllUsers, storage.RoleReader); err != nil {
+		return nil, nil, err
+	}
+
+	attrs, err := obj.Attrs(ctx)
+	fmt.Printf("Post is saved to GCS: %s\n", attrs.MediaLink)
+	return obj, attrs, err
+
+}
+
 
 // Save a post to ElasticSearch
 func saveToES(p *Post, id string) {
